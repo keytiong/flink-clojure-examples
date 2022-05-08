@@ -60,11 +60,14 @@
   :invoke (fn [_ value _]
             (log/info value)))
 
+(defn my-key [value]
+  (first value))
+
 (fk/fdef word-selector
   :fn :key-selector
   :returns (fk/type-info-of String)
   :getKey (fn [_ value]
-            (first value)))
+            (my-key value)))
 
 (defn job-graph [env]
   (-> env
