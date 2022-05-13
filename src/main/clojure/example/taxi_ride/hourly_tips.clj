@@ -10,31 +10,33 @@
   (:gen-class))
 
 
-(fk/fdef fare-driver-id-selector
-  :fn :key-selector
-  :returns (fk/type-info-of {})
-  :getKey (fn [this fare]
-            (:driver-id fare)))
+(def fare-driver-id-selector
+  (fk/flink-fn
+    {:fn      :key-selector
+     :returns (fk/type-info-of {})
+     :getKey  (fn [this fare]
+                (:driver-id fare))}))
 
+(def add-tips
+  (fk/flink-fn
+    {:fn      :process-window
+     :returns (fk/type-info-of [])
+     :process (fn [this key ctx fares out]
+                (let [tips (reduce
+                             (fn [a fare]
+                               (+ a (:tip fare)))
+                             0
+                             fares)]
+                  (.collect out [(-> ctx .window .getEnd) key tips])))}))
 
-(fk/fdef add-tips
-  :fn :process-window
-  :returns (fk/type-info-of [])
-  :process (fn [this key ctx fares out]
-             (let [tips (reduce
-                          (fn [a fare]
-                            (+ a (:tip fare)))
-                          0
-                          fares)]
-               (.collect out [(-> ctx .window .getEnd) key tips]))))
-
-(fk/fdef max-tip
-  :fn :simple-reduce
-  :returns (fk/type-info-of [])
-  :reduce (fn [this v1 v2]
-            (if (< (get v1 2) (get v2 2))
-              v2
-              v1)))
+(def max-tip
+  (fk/flink-fn
+    {:fn      :simple-reduce
+     :returns (fk/type-info-of [])
+     :reduce  (fn [this v1 v2]
+                (if (< (get v1 2) (get v2 2))
+                  v2
+                  v1))}))
 
 (defn hourly-tips [env]
   (let [ts-assigner (fk/timestamp-assigner

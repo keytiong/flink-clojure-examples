@@ -3,25 +3,29 @@
             [io.kosong.flink.clojure.core :as fk])
   (:gen-class)
   (:import (org.apache.flink.api.java.utils ParameterTool)
-           (org.apache.flink.streaming.api.environment StreamExecutionEnvironment)))
+           (org.apache.flink.streaming.api.environment StreamExecutionEnvironment)
+           (org.apache.flink.api.java.functions KeySelector)))
 
-(fk/fdef driver-tuple
-  :fn :map
-  :returns (fk/type-info-of [])
-  :map (fn [this ride]
-         [(:driver-id ride) 1]))
+(def driver-tuple
+  (fk/flink-fn
+    {:fn      :map
+     :returns (fk/type-info-of [])
+     :map     (fn [this ride]
+                [(:driver-id ride) 1])}))
 
-(fk/fdef driver-id-selector
-  :fn :key-selector
-  :returns (fk/type-info-of Long)
-  :getKey (fn [this [driver-id _]]
-            driver-id))
+(def ^KeySelector driver-id-selector
+  (fk/flink-fn
+    {:fn      :key-selector
+     :returns (fk/type-info-of Long)
+     :getKey  (fn [this [driver-id _]]
+                driver-id)}))
 
-(fk/fdef driver-ride-counter
-  :fn :reduce
-  :returns (fk/type-info-of [])
-  :reduce (fn [this [driver-id-1 count-1] [driver-id-2 count-2]]
-            [driver-id-1 (+ count-1 count-2)]))
+(def driver-ride-counter
+  (fk/flink-fn
+    {:fn      :reduce
+     :returns (fk/type-info-of [])
+     :reduce  (fn [this [driver-id-1 count-1] [driver-id-2 count-2]]
+                [driver-id-1 (+ count-1 count-2)])}))
 
 (defn ride-count [env]
   (-> env

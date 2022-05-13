@@ -6,13 +6,14 @@
            (org.apache.flink.api.java.utils ParameterTool))
   (:gen-class))
 
-(fk/fdef nyc-filter
-  :fn :filter
-  :returns (fk/type-info-of {})
-  :filter (fn [this ride]
-            (and
-              (common/is-in-nyc (:start-lon ride) (:start-lat ride))
-              (common/is-in-nyc (:end-lon ride) (:end-lat ride)))))
+(def nyc-filter
+  (fk/flink-fn
+    {:fn      :filter
+     :returns (fk/type-info-of {})
+     :filter  (fn [this ride]
+                (and
+                  (common/is-in-nyc (:start-lon ride) (:start-lat ride))
+                  (common/is-in-nyc (:end-lon ride) (:end-lat ride))))}))
 
 (defn ride-cleansing [env]
   (-> env

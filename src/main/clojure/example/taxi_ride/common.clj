@@ -1,7 +1,8 @@
 (ns example.taxi-ride.common
   (:require [io.kosong.flink.clojure.core :as fk])
   (:import (java.time Instant)
-           (java.util Random PriorityQueue Collections ArrayList)))
+           (java.util Random PriorityQueue Collections ArrayList Collection Comparator)
+           (org.apache.flink.streaming.api.functions.source SourceFunction)))
 
 (def seconds-between-rides 20)
 
@@ -36,7 +37,7 @@
      (a-long ride-id min max mean stddev)))
   ([ride-id min max mean stddev]
    (let [rnd      (Random. ride-id)
-         rnd-long #(Math/round (+ (* stddev (.nextGaussian rnd)) mean))]
+         rnd-long #(Math/round ^double (+ (* stddev (.nextGaussian rnd)) mean))]
      (loop [value (rnd-long)]
        (if (<= min value max)
          value
@@ -149,85 +150,85 @@
     (not (or (> lat lat-north) (< lat lat-south)))))
 
 
-(fk/fdef taxi-ride-generator
-  :fn :source
+(def ^SourceFunction taxi-ride-generator
+  (fk/flink-fn
+    {:fn      :source
 
-  :returns (fk/type-info-of {})
+     :returns (fk/type-info-of {})
 
-  :init (fn [this] (atom {}))
+     :init    (fn [this] (atom {}))
 
-  :open (fn [this _]
-          (let [state (.state this)
-                cmp   (comparator (fn [x y]
-                                    (let [time-x (:event-time x)
-                                          time-y (:event-time y)]
-                                      (.isBefore time-x time-y))))
-                q     (PriorityQueue. cmp)]
-            (swap! state assoc :running true)
-            (swap! state assoc :id 0)
-            (swap! state assoc :end-event-q q)
-            (swap! state assoc :max-start-time 0)))
+     :open    (fn [this _]
+                (let [state (.state this)
+                      cmp   (comparator (fn [x y]
+                                          (let [time-x (:event-time x)
+                                                time-y (:event-time y)]
+                                            (.isBefore time-x time-y))))
+                      q     (PriorityQueue. ^Comparator cmp)]
+                  (swap! state assoc :running true)
+                  (swap! state assoc :id 0)
+                  (swap! state assoc :end-event-q q)
+                  (swap! state assoc :max-start-time 0)))
 
-  :run (fn [this ctx]
-         (let [state                  (.state this)
-               batch-size             5
-               sleep-millis-per-event 10]
-           (while (:running @state)
-             (let [id           (:id @state)
-                   end-event-q  (:end-event-q @state)
-                   start-events (map
-                                  (fn [ride-id] (->taxi-ride ride-id true))
-                                  (range id (+ id batch-size)))
-                   max-start    (reduce
-                                  (fn [max-start ride]
-                                    (max max-start (.toEpochMilli (:event-time ride))))
-                                  0
-                                  start-events)]
+     :run     (fn [this ctx]
+                (let [state                  (.state this)
+                      batch-size             5
+                      sleep-millis-per-event 10]
+                  (while (:running @state)
+                    (let [id           (:id @state)
+                          end-event-q  (:end-event-q @state)
+                          start-events (map
+                                         (fn [ride-id] (->taxi-ride ride-id true))
+                                         (range id (+ id batch-size)))
+                          max-start    (reduce
+                                         (fn [max-start ride]
+                                           (max max-start (.toEpochMilli (:event-time ride))))
+                                         0
+                                         start-events)]
 
-               (doseq [ride-id (range id (+ id batch-size))]
-                 (.add end-event-q (->taxi-ride ride-id false)))
+                      (doseq [ride-id (range id (+ id batch-size))]
+                        (.add end-event-q (->taxi-ride ride-id false)))
 
-               (while (<= (-> end-event-q .peek :event-time .toEpochMilli) max-start)
-                 (.collect ctx (.poll end-event-q)))
+                      (while (<= (-> end-event-q .peek :event-time .toEpochMilli) max-start)
+                        (.collect ctx (.poll end-event-q)))
 
-               (let [out-of-order-events (ArrayList. start-events)]
-                 (Collections/shuffle out-of-order-events (Random. id))
-                 (doseq [event out-of-order-events]
-                   (.collect ctx event)))
+                      (let [out-of-order-events (ArrayList. ^Collection start-events)]
+                        (Collections/shuffle out-of-order-events (Random. id))
+                        (doseq [event out-of-order-events]
+                          (.collect ctx event)))
 
-               (swap! state assoc :end-event-q end-event-q)
-               (swap! state assoc :id (+ id batch-size))
+                      (swap! state assoc :end-event-q end-event-q)
+                      (swap! state assoc :id (+ id batch-size))
 
-               (Thread/sleep (* batch-size sleep-millis-per-event))
+                      (Thread/sleep (* batch-size sleep-millis-per-event))))))
 
-               ))))
+     :cancel  (fn [this]
+                (let [state (.state this)]
+                  (swap! state assoc :running false)))}))
 
-  :cancel (fn [this]
-            (let [state (.state this)]
-              (swap! state assoc :running false))))
+(def ^SourceFunction taxi-fare-generator
+  (fk/flink-fn
+    {:fn      :source
 
-(fk/fdef taxi-fare-generator
-  :fn :source
+     :returns (fk/type-info-of {})
 
-  :returns (fk/type-info-of {})
+     :init    (fn [this] (atom {}))
 
-  :init (fn [this] (atom {}))
+     :open    (fn [this _]
+                (let [state (.state this)]
+                  (swap! state assoc :running true)))
 
-  :open (fn [this _]
-          (let [state (.state this)]
-            (swap! state assoc :running true)))
+     :run     (fn [this ctx]
+                (let [state                  (.state this)
+                      sleep-millis-per-event 10]
+                  (loop [running (:running @state)
+                         ride-id 1]
+                    (when running
+                      (let [fare (->taxi-fare ride-id)]
+                        (.collect ctx fare)
+                        (Thread/sleep sleep-millis-per-event)))
+                    (recur (:running @state) (inc ride-id)))))
 
-  :run (fn [this ctx]
-         (let [state                  (.state this)
-               sleep-millis-per-event 10]
-           (loop [running (:running @state)
-                  ride-id 1]
-             (when running
-               (let [fare (->taxi-fare ride-id)]
-                 (.collect ctx fare)
-                 (Thread/sleep sleep-millis-per-event)))
-             (recur (:running @state) (inc ride-id)))))
-
-  :cancel (fn [this]
-            (let [state (.state this)]
-              (swap! state assoc :running false))))
+     :cancel  (fn [this]
+                (let [state (.state this)]
+                  (swap! state assoc :running false)))}))
