@@ -7,7 +7,7 @@
             [clojure.tools.logging :as log])
   (:import (org.apache.flink.streaming.api.environment StreamExecutionEnvironment)
            (org.apache.flink.api.common.typeinfo Types)
-           (org.elasticsearch.client RestClient Request)
+           (org.elasticsearch.client RestClient Request RestClientBuilder$HttpClientConfigCallback)
            (org.apache.http HttpHost)
            (org.apache.http.util EntityUtils)
            (java.io FileNotFoundException)
@@ -15,23 +15,44 @@
            (org.apache.flink.streaming.connectors.elasticsearch ElasticsearchSinkBase$FlushBackoffType ElasticsearchSinkFunction)
            (org.elasticsearch.action.index IndexRequest)
            (org.elasticsearch.common.xcontent XContentType)
-           (org.apache.flink.streaming.connectors.elasticsearch7 ElasticsearchSink$Builder)
-           (org.apache.flink.api.java.utils ParameterTool))
+           (org.apache.flink.streaming.connectors.elasticsearch7 ElasticsearchSink$Builder RestClientFactory)
+           (org.apache.flink.api.java.utils ParameterTool)
+           (java.net URL)
+           (org.apache.http.client CredentialsProvider)
+           (org.apache.http.auth UsernamePasswordCredentials))
   (:gen-class))
-
 
 (def timestamp-kw (keyword "@timestamp"))
 
-(defn elasticsearch-client [{:keys [host port scheme]}]
-  (let [http-host (HttpHost. host port scheme)]
-    (-> (RestClient/builder (into-array HttpHost [http-host]))
+(deftype ElasticsearchHttpClientConfigCallback [username password]
+  :load-ns true
+  RestClientBuilder$HttpClientConfigCallback
+  (customizeHttpClient [this builder]
+    (let [provider (reify CredentialsProvider
+                     (getCredentials [this scope]
+                       (UsernamePasswordCredentials. username password)))]
+      (.setDefaultCredentialsProvider builder provider))))
+
+(deftype ElasticsearchRestClientFactory [username password]
+  :load-ns true
+  RestClientFactory
+  (configureRestClientBuilder [this builder]
+    (let [callback (->ElasticsearchHttpClientConfigCallback username password)]
+      (doto builder
+        (.setHttpClientConfigCallback callback)))))
+
+(defn ->elasticsearch-client [{:keys [urls username password]}]
+  (let [http-hosts (map (fn [url-str]
+                          (let [url    (URL. url-str)
+                                host   (.getHost url)
+                                port   (or (.getPort url) 9200)
+                                scheme (or (.getProtocol url) "http")]
+                            (HttpHost. host port scheme)))
+                     urls)
+        callback   (->ElasticsearchHttpClientConfigCallback username password)]
+    (-> (RestClient/builder (into-array HttpHost http-hosts))
+      (.setHttpClientConfigCallback callback)
       (.build))))
-
-;;
-;; parameters
-;;
-
-(def job-history-server "http://localhost:18080/api/v1")
 
 ;;
 ;; Spark History Server Source
@@ -61,19 +82,19 @@
       (assoc :application_attempt_id app-attempt-id)
       (assoc :spark_type "job"))))
 
-(defn- transform-spark-stage-record [app job stage]
+(defn- transform-spark-stage-record [job stage]
   (let [now                          (System/currentTimeMillis)
-        app-id                       (:application_id app)
-        app-attempt-id               (:application_attempt_id app)
+        app-id                       (:application_id job)
+        app-attempt-id               (:application_attempt_id job)
         job-id                       (:job_id job)
         stage-attempt-id             (:attempt_id stage)
         flatten-task-map             (fn [m]
                                        (->> m
-                                         (map (fn [[k t]] (assoc t :task_id k)))
+                                         (map (fn [[k t]] (assoc t :task_id (name k))))
                                          vec))
         flatten-executor-summary-map (fn [m]
                                        (->> m
-                                         (map (fn [[k s]] (assoc s :executor_id k)))
+                                         (map (fn [[k s]] (assoc s :executor_id (name k))))
                                          vec))]
     (-> stage
       (assoc timestamp-kw now)
@@ -86,11 +107,11 @@
       (assoc :spark_type "stage")
       (dissoc :attempt_id))))
 
-(defn- transform-spark-task-record [app job stage task]
+(defn- transform-spark-task-record [stage task]
   (let [now              (System/currentTimeMillis)
-        app-id           (:application_id app)
-        app-attempt-id   (:application_attempt_id app)
-        job-id           (:job_id job)
+        app-id           (:application_id stage)
+        app-attempt-id   (:application_attempt_id stage)
+        job-id           (:job_id stage)
         stage_id         (:stage_id stage)
         stage-attempt-id (:stage_attempt_id stage)
         task-attempt-id  (:attempt task)]
@@ -121,56 +142,79 @@
       (update-in [:system_properties] prop-key-xform)
       (update-in [:classpath_entries] collect-first))))
 
-(defn fetch-application-records [last-update-time]
+(defn fetch-application-records [history-server last-update-time]
   (let [now  (System/currentTimeMillis)
-        url  (str job-history-server "/applications")
-        resp (slurp url)
+        url  (str history-server "/applications")
+        resp (try
+               (slurp url)
+               (catch Throwable t
+                 (log/error t)))
         apps (->> (json/read-str resp :key-fn csk/->snake_case_keyword))]
     (->> (mapcat transform-spark-application-record apps)
       (filter #(< last-update-time (:last_updated_epoch %)))
       (map (fn [app] (assoc app timestamp-kw now))))))
 
-(defn fetch-environment-record [app]
+(defn fetch-environment-record [history-server app]
   (let [app-id (:application_id app)
-        url    (str job-history-server "/applications/" app-id "/environment")
-        resp   (slurp url)
+        url    (str history-server "/applications/" app-id "/environment")
+        resp   (try
+                 (slurp url)
+                 (catch Throwable t
+                   (log/error t)))
         now    (System/currentTimeMillis)
         env    (some-> resp
                  (json/read-str :key-fn csk/->snake_case_keyword)
                  (assoc timestamp-kw now))]
     (transform-spark-environment-record app env)))
 
-(defn fetch-job-records [app]
+(defn fetch-job-records [history-server app]
   (let [app-id         (:application_id app)
         app-attempt-id (:application_attempt_id app)
         url            (if app-attempt-id
-                         (str job-history-server "/applications/" app-id "/" app-attempt-id "/jobs")
-                         (str job-history-server "/applications/" app-id "/jobs"))
-        resp           (slurp url)
+                         (str history-server "/applications/" app-id "/" app-attempt-id "/jobs")
+                         (str history-server "/applications/" app-id "/jobs"))
+        resp           (try
+                         (slurp url)
+                         (catch Throwable t
+                           (log/error t)))
         now            (System/currentTimeMillis)
-        jobs           (json/read-str resp :key-fn csk/->snake_case_keyword)]
+        jobs           (some-> resp
+                         (json/read-str :key-fn csk/->snake_case_keyword))]
     (->> jobs
       (map (partial transform-spark-job-record app))
       (map (fn [job] (assoc job timestamp-kw now))))))
 
 
-(defn fetch-stage-records [app job]
-  (let [app-id         (:application_id app)
-        app-attempt-id (:application_attempt_id app)
+(defn fetch-stage-records [history-server job]
+  (let [app-id         (:application_id job)
+        app-attempt-id (:application_attempt_id job)
         fetch-fn       (fn [stage-id]
                          (let [url            (if app-attempt-id
-                                                (str job-history-server "/applications/" app-id "/" app-attempt-id "/stages/" stage-id)
-                                                (str job-history-server "/applications/" app-id "/stages/" stage-id))
+                                                (str history-server "/applications/" app-id "/" app-attempt-id "/stages/" stage-id)
+                                                (str history-server "/applications/" app-id "/stages/" stage-id))
                                resp           (try
                                                 (slurp url)
-                                                (catch FileNotFoundException e
-                                                  (log/error e)))
+                                                (catch Throwable t
+                                                  (log/error t)))
                                now            (System/currentTimeMillis)
                                stage-attempts (some-> resp
                                                 (json/read-str :key-fn csk/->snake_case_keyword))]
                            (map #(assoc % timestamp-kw now) stage-attempts)))
         stages         (mapcat fetch-fn (:stage_ids job))]
-    (map (partial transform-spark-stage-record app job) stages)))
+    (map (partial transform-spark-stage-record job) stages)))
+
+(defn history-server-open [this config]
+  (let [state  (.state this)
+        params (some-> this
+                 .getRuntimeContext
+                 .getExecutionConfig
+                 .getGlobalJobParameters
+                 .toMap)
+        params (ParameterTool/fromMap params)
+        url    (.get params "app.history-server-url")
+        sleep  (or (.getLong params "app.history-server-pause-between-poll") 5000)]
+    (swap! state assoc :history-server (str url "/api/v1"))
+    (swap! state assoc :history-server-sleep sleep)))
 
 (defn history-server-initialize-state [this context]
   (let [state                       (.state this)
@@ -193,20 +237,22 @@
     (.add checkpoint-state last-update-time)))
 
 (defn history-server-run [this context]
-  (let [state (.state this)]
+  (let [state          (.state this)
+        history-server (:history-server @state)
+        sleep-millis   (:history-server-sleep @state)]
     (swap! state assoc :running true)
     (while (:running @state)
       (let [prev-update-time (or (:last-update-time @state) 0)
             next-update-time (ref prev-update-time)
-            apps             (->> (fetch-application-records prev-update-time)
+            apps             (->> (fetch-application-records history-server prev-update-time)
                                (sort-by :last_updated_epoch))]
         (doseq [app apps]
           (let [this-update-time (:last_updated_epoch app)]
             (when (< prev-update-time this-update-time)
               (dosync (ref-set next-update-time this-update-time))
-              (.collect context app #_(json/json-str app :key-fn name)))))
+              (.collect context app))))
         (swap! state assoc :last-update-time @next-update-time))
-      (Thread/sleep 5000))))
+      (Thread/sleep sleep-millis))))
 
 (defn history-server-cancel [this]
   (let [state (.state this)]
@@ -216,35 +262,41 @@
 ;; Spark Log Processor
 ;;
 
+(defn normalize-document [doc]
+  (-> doc
+    (dissoc timestamp-kw)
+    (dissoc :data_stream)
+    (dissoc :ecs)
+    (dissoc :host)))
+
 (defn same-document? [doc-1 doc-2]
-  (= (dissoc doc-1 timestamp-kw) (dissoc doc-2 timestamp-kw)))
+  (= (normalize-document doc-1) (normalize-document doc-2)))
 
 (defn ->index-id [prefix bucket-size time]
   (let [bucket-id (* (quot time bucket-size) bucket-size)]
     (str prefix bucket-id)))
 
-(defn app-doc-id [app]
-  (let [app-id         (:application_id app)
-        app-attempt-id (or (:application_attempt_id app) "")]
+(defn app-doc-id [doc]
+  (let [app-id         (:application_id doc)
+        app-attempt-id (or (:application_attempt_id doc) "")]
     (str app-id ":" app-attempt-id)))
 
-(defn env-doc-id [env]
-  (let [app-id (:application_id env)]
-    (str app-id ":_environment")))
+(defn env-doc-id [doc]
+  (str (app-doc-id doc) ":" "_environment"))
 
-(defn job-doc-id [app job]
-  (let [job-id (:job_id job)]
-    (str (app-doc-id app) ":" job-id)))
+(defn job-doc-id [doc]
+  (let [job-id (:job_id doc)]
+    (str (app-doc-id doc) ":" job-id)))
 
-(defn stage-doc-id [app job stage]
-  (let [stage-id         (:stage_id stage)
-        stage-attempt-id (:stage_attempt_id stage)]
-    (str (job-doc-id app job) ":" stage-id ":" stage-attempt-id)))
+(defn stage-doc-id [doc]
+  (let [stage-id         (:stage_id doc)
+        stage-attempt-id (:stage_attempt_id doc)]
+    (str (job-doc-id doc) ":" stage-id ":" stage-attempt-id)))
 
-(defn task-doc-id [app job stage task]
-  (let [task-id         (:task_id task)
-        task-attempt-id (:task_attempt_id task)]
-    (str (stage-doc-id app job stage) ":" task-id ":" task-attempt-id)))
+(defn task-doc-id [doc]
+  (let [task-id         (:task_id doc)
+        task-attempt-id (:task_attempt_id doc)]
+    (str (stage-doc-id doc) ":" task-id ":" task-attempt-id)))
 
 (defn es-lookup-doc [processor index-id doc-id]
   (let [state     (.state processor)
@@ -318,12 +370,13 @@
     (.performRequest es-client request)))
 
 (defn process-environment [processor app context out]
-  (let [state       (.state processor)
-        start-time  (:start_time_epoch app)
-        index-id-fn (:index-id-fn @state)
-        index-id    (index-id-fn start-time)
-        doc-id      (env-doc-id app)
-        env         (fetch-environment-record app)]
+  (let [state          (.state processor)
+        history-server (:history-server @state)
+        start-time     (:start_time_epoch app)
+        index-id-fn    (:index-id-fn @state)
+        index-id       (index-id-fn start-time)
+        doc-id         (env-doc-id app)
+        env            (fetch-environment-record history-server app)]
     (.collect out {:index-id index-id
                    :doc-id   doc-id
                    :source   env})))
@@ -333,7 +386,7 @@
         start-time  (:start_time_epoch app)
         index-id-fn (:index-id-fn @state)
         index-id    (index-id-fn start-time)
-        doc-id      (task-doc-id app job stage task)
+        doc-id      (task-doc-id task)
         existing    (lookup-task-doc processor index-id doc-id)]
     (when (or (= "RUNNING" (:status task))
             (not (same-document? existing task)))
@@ -346,13 +399,13 @@
   (let [state       (.state processor)
         tasks       (map
                       (fn [task]
-                        (transform-spark-task-record app job stage task))
+                        (transform-spark-task-record stage task))
                       (:tasks stage))
         stage       (dissoc stage :tasks)
         start-time  (:start_time_epoch app)
         index-id-fn (:index-id-fn @state)
         index-id    (index-id-fn start-time)
-        doc-id      (stage-doc-id app job stage)
+        doc-id      (stage-doc-id stage)
         existing    (lookup-stage-doc processor index-id doc-id)]
     (when (or (= "ACTIVE" (:status stage))
             (not (same-document? existing stage)))
@@ -364,16 +417,17 @@
                      :source   stage}))))
 
 (defn process-job [processor app job context out]
-  (let [state       (.state processor)
-        start-time  (:start_time_epoch app)
-        index-id-fn (:index-id-fn @state)
-        index-id    (index-id-fn start-time)
-        doc-id      (job-doc-id app job)
-        existing    (lookup-job-doc processor index-id doc-id)]
+  (let [state          (.state processor)
+        history-server (:history-server @state)
+        start-time     (:start_time_epoch app)
+        index-id-fn    (:index-id-fn @state)
+        index-id       (index-id-fn start-time)
+        doc-id         (job-doc-id job)
+        existing       (lookup-job-doc processor index-id doc-id)]
     (when (or (= "RUNNING" (:status job))
             (not (same-document? existing job)))
       (invalidate-job-cache processor doc-id)
-      (let [stages (fetch-stage-records app job)]
+      (let [stages (fetch-stage-records history-server job)]
         (doseq [stage stages]
           (process-stage processor app job stage context out)))
       (.collect out {:index-id index-id
@@ -381,41 +435,53 @@
                      :source   job}))))
 
 (defn process-app [processor app context out]
-  (let [state       (.state processor)
-        start-time  (:start_time_epoch app)
-        index-id-fn (:index-id-fn @state)
-        index-id    (index-id-fn start-time)
-        doc-id      (app-doc-id app)
-        existing    (lookup-app-doc processor index-id doc-id)]
+  (let [state          (.state processor)
+        history-server (:history-server @state)
+        start-time     (:start_time_epoch app)
+        index-id-fn    (:index-id-fn @state)
+        index-id       (index-id-fn start-time)
+        doc-id         (app-doc-id app)
+        existing       (lookup-app-doc processor index-id doc-id)]
     (when-not existing
       (process-environment processor app context out))
     (when (or (not (:completed app))
             (not (same-document? existing app)))
       (invalidate-app-cache processor doc-id)
-      (doseq [job (fetch-job-records app)]
+      (doseq [job (fetch-job-records history-server app)]
         (process-job processor app job context out))
       (.collect out {:index-id index-id
                      :doc-id   doc-id
                      :source   app}))))
 
 (defn spark-log-processor-open [this config]
-  (let [config-map  (.toMap config)
-        es-host     (get config-map "elastic.host.1" "localhost")
-        es-port     (Integer/parseInt (get config-map "elastic.port.1" "9200"))
-        es-scheme   (get config-map "elastic.scheme.1" "http")
-        es-client   (elasticsearch-client {:host es-host :port es-port :scheme es-scheme})
-        app-cache   (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
-        job-cache   (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
-        stage-cache (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
-        task-cache  (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
-        index-id-fn (partial ->index-id "sparklog-" (* 24 60 60 1000))
-        state-1     (-> (deref (.state this))
-                      (assoc :es-client es-client)
-                      (assoc :app-cache app-cache)
-                      (assoc :job-cache job-cache)
-                      (assoc :stage-cache stage-cache)
-                      (assoc :task-cache task-cache)
-                      (assoc :index-id-fn index-id-fn))]
+  (let [params            (some-> this
+                            .getRuntimeContext
+                            .getExecutionConfig
+                            .getGlobalJobParameters
+                            .toMap)
+        state             (.state this)
+        params            (ParameterTool/fromMap params)
+        es-urls           (some-> (.get params "app.elasticsearch-urls")
+                            (str/split #","))
+        es-username       (.get params "app.elasticsearch-username")
+        es-password       (.get params "app.elasticsearch-password")
+        index-prefix      (.get params "app.index-prefix")
+        index-bucket-size (.getLong params "app.index-bucket-size")
+        es-client         (->elasticsearch-client {:urls es-urls :username es-username :password es-password})
+        app-cache         (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
+        job-cache         (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
+        stage-cache       (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
+        task-cache        (clojure.core.cache/ttl-cache-factory {} :ttl (* 30 60 1000))
+        index-id-fn       (partial ->index-id index-prefix index-bucket-size)
+        history-server    (str (.get params "app.history-server-url") "/api/v1")
+        state-1           (-> (deref (.state this))
+                            (assoc :es-client es-client)
+                            (assoc :app-cache app-cache)
+                            (assoc :job-cache job-cache)
+                            (assoc :stage-cache stage-cache)
+                            (assoc :task-cache task-cache)
+                            (assoc :index-id-fn index-id-fn)
+                            (assoc :history-server history-server))]
     (reset! (.state this) state-1)))
 
 (defn spark-log-processor-processElement [this value context out]
@@ -431,64 +497,36 @@
     (reset! (.state this) state-1)))
 
 ;;
-;; Simple Elastic Sink
-;;
-
-(defn es-sink-open [processor config]
-  (let [state      (.state processor)
-        config-map (.toMap config)
-        es-host    (get config-map "elastic.host.1" "localhost")
-        es-port    (Integer/parseInt (get config-map "elastic.port.1" "9200"))
-        es-scheme  (get config-map "elastic.scheme.1" "http")
-        es-client  (elasticsearch-client {:host es-host :port es-port :scheme es-scheme})]
-    (swap! state assoc :es-client es-client)))
-
-(defn es-sink-invoke [processor value context]
-  (let [state     (.state processor)
-        index-id  (:index-id value)
-        doc       (:source value)
-        doc-id    (:doc-id value)
-        path      (str "/" index-id "/_update/" doc-id)
-        body      {:doc           doc
-                   :doc_as_upsert true}
-        body-json (json/json-str body :key-fn name)
-        request   (doto (Request. "POST" path)
-                    (.setJsonEntity body-json))
-        es-client (:es-client @state)]
-    (.performRequest es-client request)))
-
-(fk/fdef es-sink
-  :fn :sink
-  :init (fn [_] (atom {}))
-  :open es-sink-open
-  :invoke es-sink-invoke)
-
-;;
 ;; Elastisearch connector
 ;;
 
-(fk/fdef spark-history-loader
-  :fn :source
-  :returns (fk/type-info-of {})
-  :init (fn [_] (atom {}))
-  :run history-server-run
-  :cancel history-server-cancel
-  :initializeState history-server-initialize-state
-  :snapshotState history-server-snapshot-state)
+(def history-server-source
+  (fk/flink-fn
+    {
+     :fn              :source
+     :returns         (fk/type-info-of {})
+     :init            (fn [_] (atom {}))
+     :open            history-server-open
+     :run             history-server-run
+     :cancel          history-server-cancel
+     :initializeState history-server-initialize-state
+     :snapshotState   history-server-snapshot-state}))
 
-(fk/fdef application-id-selector
-  :fn :key-selector
-  :returns Types/STRING
-  :getKey (fn [_ value]
-            (:application_id value)))
+(def application-id-selector
+  (fk/flink-fn
+    {:fn      :key-selector
+     :returns Types/STRING
+     :getKey  (fn [_ value]
+                (:application_id value))}))
 
-(fk/fdef spark-log-processor
-  :fn :keyed-process
-  :returns (fk/type-info-of {})
-  :open spark-log-processor-open
-  :close spark-log-processor-close
-  :init (fn [_] (atom {}))
-  :processElement spark-log-processor-processElement)
+(def spark-log-processor
+  (fk/flink-fn
+    {:fn             :keyed-process
+     :returns        (fk/type-info-of {})
+     :open           spark-log-processor-open
+     :close          spark-log-processor-close
+     :init           (fn [_] (atom {}))
+     :processElement spark-log-processor-processElement}))
 
 (defn elassticsearch-emitter []
   (reify ElasticsearchSinkFunction
@@ -503,40 +541,66 @@
                        (.source doc XContentType/JSON))]
         (.add indexer (into-array IndexRequest [req]))))))
 
-(def elasticsearch-sink
+(defn ->elasticsearch-sink [http-hosts username password]
   (let [emitter (elassticsearch-emitter)
-        hosts   [(HttpHost. "localhost" 9200 "http")]
-        builder (doto (ElasticsearchSink$Builder. hosts emitter)
+        factory (->ElasticsearchRestClientFactory username password)
+        builder (doto (ElasticsearchSink$Builder. http-hosts emitter)
                   (.setBulkFlushMaxActions 64)
                   (.setBulkFlushInterval 5000)
                   (.setBulkFlushBackoff true)
                   (.setBulkFlushBackoffRetries 10)
                   (.setBulkFlushBackoffDelay 2000)
+                  (.setRestClientFactory factory)
                   (.setBulkFlushBackoffType ElasticsearchSinkBase$FlushBackoffType/EXPONENTIAL))]
     (.build builder)))
 
-(defn job-graph [env]
-  (-> env
-    (.addSource spark-history-loader)
-    (.uid "6aaaf00d-a133-4cb5-b0c3-c625c7ee1f20")
-    (.name "Spark History Server")
-    (.keyBy application-id-selector)
-    (.process spark-log-processor)
-    (.uid "4db0c481-cd89-4bd7-abd9-8351c505830f")
-    (.name "Spark Log Processor")
-    (.addSink elasticsearch-sink)
-    (.disableChaining)
-    (.uid "a8d91e4b-a621-4364-96a9-48913b531224")
-    (.name "Elasticsearch Store"))
+(defn job-graph [env params]
+  (let [es-username        (.get params "app.elasticsearch-username")
+        es-password        (.get params "app.elasticsearch-password")
+        http-hosts         (->> (str/split (.get params "app.elasticsearch-urls") #",")
+                             (map (fn [url-str]
+                                    (let [url    (URL. url-str)
+                                          host   (.getHost url)
+                                          scheme (or (.getProtocol url) "http")
+                                          port   (or (.getPort url) 9200)]
+                                      (HttpHost. host port scheme))))
+                             (reduce conj []))
+        elasticsearch-sink (->elasticsearch-sink http-hosts es-username es-password)]
+    (-> env
+      (.addSource history-server-source)
+      (.uid "6aaaf00d-a133-4cb5-b0c3-c625c7ee1f20")
+      (.name "Spark History Server")
+      (.keyBy application-id-selector)
+      (.process spark-log-processor)
+      (.uid "4db0c481-cd89-4bd7-abd9-8351c505830f")
+      (.name "Spark Log Processor")
+      (.addSink elasticsearch-sink)
+      (.disableChaining)
+      (.uid "a8d91e4b-a621-4364-96a9-48913b531224")
+      (.name "Elasticsearch Store")))
   env)
+
+
+(def default-params
+  {"app.data-stream-type"                  "logs"
+   "app.data-stream-dataset"               "spark_history"
+   "app.data-stream-namespace"             "dev"
+   "app.index-prefix"                      "logs-spark_history-dev-"
+   "app.index-bucket-size"                 "604800000"
+   "app.history-server-url"                "http://localhost:18080"
+   "app.history-server-pause-between-poll" "15000"
+   "app.elasticsearch-urls"                "http://localhost:9200"
+   "app.elasticsearch-username"            ""
+   "app.elasticsearch-password"            ""})
 
 (defn -main [& args]
   (let [args   (into-array String args)
-        params (ParameterTool/fromArgs args)
-        config (.getConfiguration params)]
-    (-> (StreamExecutionEnvironment/createLocalEnvironmentWithWebUI config)
-      (.enableCheckpointing 60000)
-      (.setParallelism 2)
-      (fk/register-clojure-types)
-      (job-graph)
+        params (-> (ParameterTool/fromMap default-params)
+                 (.mergeWith (ParameterTool/fromArgs args)))
+        config (.getConfiguration params)
+        env    (StreamExecutionEnvironment/getExecutionEnvironment config)]
+    (.. env getConfig (setGlobalJobParameters params))
+    (fk/register-clojure-types env)
+    (-> env
+      (job-graph params)
       (.execute))))
