@@ -10,16 +10,16 @@
            (org.elasticsearch.client RestClient Request RestClientBuilder$HttpClientConfigCallback)
            (org.apache.http HttpHost)
            (org.apache.http.util EntityUtils)
-           (java.io FileNotFoundException)
            (org.apache.flink.api.common.state ListStateDescriptor)
            (org.apache.flink.streaming.connectors.elasticsearch ElasticsearchSinkBase$FlushBackoffType ElasticsearchSinkFunction)
            (org.elasticsearch.action.index IndexRequest)
            (org.elasticsearch.common.xcontent XContentType)
-           (org.apache.flink.streaming.connectors.elasticsearch7 ElasticsearchSink$Builder RestClientFactory)
            (org.apache.flink.api.java.utils ParameterTool)
            (java.net URL)
            (org.apache.http.client CredentialsProvider)
-           (org.apache.http.auth UsernamePasswordCredentials))
+           (org.apache.http.auth UsernamePasswordCredentials)
+           (org.apache.flink.connector.elasticsearch.sink Elasticsearch7SinkBuilder ElasticsearchEmitter RequestIndexer FlushBackoffType)
+           (org.apache.flink.api.connector.sink2 SinkWriter$Context))
   (:gen-class))
 
 (def timestamp-kw (keyword "@timestamp"))
@@ -32,14 +32,6 @@
                      (getCredentials [this scope]
                        (UsernamePasswordCredentials. username password)))]
       (.setDefaultCredentialsProvider builder provider))))
-
-(deftype ElasticsearchRestClientFactory [username password]
-  :load-ns true
-  RestClientFactory
-  (configureRestClientBuilder [this builder]
-    (let [callback (->ElasticsearchHttpClientConfigCallback username password)]
-      (doto builder
-        (.setHttpClientConfigCallback callback)))))
 
 (defn ->elasticsearch-client [{:keys [urls username password]}]
   (let [http-hosts (map (fn [url-str]
@@ -529,8 +521,8 @@
      :processElement spark-log-processor-processElement}))
 
 (defn elassticsearch-emitter []
-  (reify ElasticsearchSinkFunction
-    (process [this record context indexer]
+  (reify ElasticsearchEmitter
+    (^void emit [this record ^SinkWriter$Context context ^RequestIndexer indexer]
       (let [index-id (:index-id record)
             doc      (some-> (:source record)
                        (json/json-str :key-fn name))
@@ -543,15 +535,14 @@
 
 (defn ->elasticsearch-sink [http-hosts username password]
   (let [emitter (elassticsearch-emitter)
-        factory (->ElasticsearchRestClientFactory username password)
-        builder (doto (ElasticsearchSink$Builder. http-hosts emitter)
+        builder (doto (Elasticsearch7SinkBuilder.)
+                  (.setHosts (into-array HttpHost http-hosts))
+                  (.setEmitter emitter)
                   (.setBulkFlushMaxActions 64)
                   (.setBulkFlushInterval 5000)
-                  (.setBulkFlushBackoff true)
-                  (.setBulkFlushBackoffRetries 10)
-                  (.setBulkFlushBackoffDelay 2000)
-                  (.setRestClientFactory factory)
-                  (.setBulkFlushBackoffType ElasticsearchSinkBase$FlushBackoffType/EXPONENTIAL))]
+                  (.setBulkFlushBackoffStrategy FlushBackoffType/EXPONENTIAL 10 2000)
+                  (.setConnectionUsername username)
+                  (.setConnectionPassword password))]
     (.build builder)))
 
 (defn job-graph [env params]
@@ -574,7 +565,7 @@
       (.process spark-log-processor)
       (.uid "4db0c481-cd89-4bd7-abd9-8351c505830f")
       (.name "Spark Log Processor")
-      (.addSink elasticsearch-sink)
+      (.sinkTo elasticsearch-sink)
       (.disableChaining)
       (.uid "a8d91e4b-a621-4364-96a9-48913b531224")
       (.name "Elasticsearch Store")))
