@@ -11,7 +11,6 @@
            (org.apache.http HttpHost)
            (org.apache.http.util EntityUtils)
            (org.apache.flink.api.common.state ListStateDescriptor)
-           (org.apache.flink.streaming.connectors.elasticsearch ElasticsearchSinkBase$FlushBackoffType ElasticsearchSinkFunction)
            (org.elasticsearch.action.index IndexRequest)
            (org.elasticsearch.common.xcontent XContentType)
            (org.apache.flink.api.java.utils ParameterTool)
