@@ -17,7 +17,6 @@
     <maven.compiler.source>${target.java.version}</maven.compiler.source>
     <maven.compiler.target>${target.java.version}</maven.compiler.target>
     <log4j.version>2.17.1</log4j.version>
-    <elasticsearch.version>7.17.1</elasticsearch.version>
   </properties>
 
   <repositories>
@@ -55,22 +54,18 @@
 
     <dependency>
       <groupId>org.clojure</groupId>
-      <artifactId>data.json</artifactId>
-      <version>2.4.0</version>
+      <artifactId>tools.logging</artifactId>
+      <version>1.2.4</version>
     </dependency>
 
-    <dependency>
-      <groupId>org.clojure</groupId>
-      <artifactId>core.cache</artifactId>
-      <version>1.0.225</version>
-    </dependency>
-
-    <!-- This dependency is provided, because it should not be packaged into the JAR file. -->
     <dependency>
       <groupId>io.kosong.flink</groupId>
       <artifactId>flink-clojure</artifactId>
       <version>0.2.0</version>
     </dependency>
+
+    <!-- These dependencies are provided, because they should not be packaged into the JAR file. -->
+
     <dependency>
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-clients</artifactId>
@@ -82,30 +77,6 @@
       <artifactId>flink-runtime-web</artifactId>
       <version>${flink.version}</version>
       <scope>provided</scope>
-    </dependency>
-
-    <dependency>
-      <groupId>org.elasticsearch.client</groupId>
-      <artifactId>elasticsearch-rest-client</artifactId>
-      <version>${elasticsearch.version}</version>
-    </dependency>
-
-    <dependency>
-      <groupId>org.apache.flink</groupId>
-      <artifactId>flink-connector-elasticsearch7</artifactId>
-      <version>1.15.0</version>
-    </dependency>
-
-    <dependency>
-      <groupId>org.clojure</groupId>
-      <artifactId>tools.logging</artifactId>
-      <version>1.2.4</version>
-    </dependency>
-
-    <dependency>
-      <groupId>camel-snake-kebab</groupId>
-      <artifactId>camel-snake-kebab</artifactId>
-      <version>0.4.2</version>
     </dependency>
 
     <!-- Add logging framework, to produce console output when running in the IDE. -->
