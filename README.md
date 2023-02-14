@@ -1,5 +1,9 @@
 # flink-clojure-examples
-Examples of Apache Flink application developed with Clojure
+Examples of Apache Flink jobs developed with Clojure.
+
+This is a demonstration 
+of [flink-clojure](https://github.com/keytiong/flink-clojure) with 
+[flink-training](https://github.com/apache/flink-training) taxi ride examples.
 
 ## Build
 ```shell
